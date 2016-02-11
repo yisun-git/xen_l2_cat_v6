@@ -98,6 +98,7 @@ struct feat_hw_info {
     union {
         struct psr_cat_hw_info l3_cat_info;
         struct psr_cat_hw_info l3_cdp_info;
+        struct psr_cat_hw_info l2_cat_info;
     };
 };
 
@@ -235,6 +236,7 @@ static DEFINE_PER_CPU(struct psr_assoc, psr_assoc);
  */
 static struct feat_node *feat_l3_cat;
 static struct feat_node *feat_l3_cdp;
+static struct feat_node *feat_l2_cat;
 
 /* Common functions. */
 static void free_feature(struct psr_socket_info *info)
@@ -679,6 +681,53 @@ struct feat_ops l3_cdp_ops = {
     .compare_val = l3_cdp_compare_val,
     .fits_cos_max = l3_cdp_fits_cos_max,
     .write_msr = l3_cdp_write_msr,
+};
+
+/* L2 CAT callback functions implementation. */
+static void l2_cat_init_feature(struct cpuid_leaf regs,
+                                struct feat_node *feat,
+                                struct psr_socket_info *info)
+{
+    struct psr_cat_hw_info l2_cat;
+    unsigned int socket;
+
+    /* No valid values so do not enable the feature. */
+    if ( !regs.a || !regs.d )
+        return;
+
+    l2_cat.cbm_len = (regs.a & CAT_CBM_LEN_MASK) + 1;
+    l2_cat.cos_max = min(opt_cos_max, regs.d & CAT_COS_MAX_MASK);
+
+    /* cos=0 is reserved as default cbm(all ones). */
+    feat->cos_reg_val[0] = (1ull << l2_cat.cbm_len) - 1;
+
+    feat->feature = PSR_SOCKET_L2_CAT;
+    ASSERT(!test_bit(PSR_SOCKET_L2_CAT, &info->feat_mask));
+    __set_bit(PSR_SOCKET_L2_CAT, &info->feat_mask);
+
+    feat->info.l2_cat_info = l2_cat;
+
+    info->nr_feat++;
+
+    /* Add this feature into list. */
+    list_add_tail(&feat->list, &info->feat_list);
+
+    socket = cpu_to_socket(smp_processor_id());
+    if ( !opt_cpu_info )
+        return;
+
+    printk(XENLOG_INFO "L2 CAT: enabled on socket %u, cos_max:%u, cbm_len:%u.\n",
+           socket, feat->info.l2_cat_info.cos_max,
+           feat->info.l2_cat_info.cbm_len);
+}
+
+static unsigned int l2_cat_get_cos_max(const struct feat_node *feat)
+{
+    return feat->info.l2_cat_info.cos_max;
+}
+
+struct feat_ops l2_cat_ops = {
+    .get_cos_max = l2_cat_get_cos_max,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
@@ -1454,6 +1503,18 @@ static void cpu_init_work(void)
             l3_cat_init_feature(regs, feat, info);
         }
     }
+
+    cpuid_count_leaf(PSR_CPUID_LEVEL_CAT, 0, &regs);
+    if ( regs.b & PSR_RESOURCE_TYPE_L2 )
+    {
+        cpuid_count_leaf(PSR_CPUID_LEVEL_CAT, 2, &regs);
+
+        feat = feat_l2_cat;
+        /* psr_cpu_prepare will allocate it on subsequent CPU onlining. */
+        feat_l2_cat = NULL;
+        feat->ops = l2_cat_ops;
+        l2_cat_init_feature(regs, feat, info);
+    }
 }
 
 static void cpu_fini_work(unsigned int cpu)
@@ -1509,6 +1570,17 @@ static int psr_cpu_prepare(unsigned int cpu)
     {
         xfree(feat_l3_cat);
         feat_l3_cat = NULL;
+        return -ENOMEM;
+    }
+
+    if ( feat_l2_cat == NULL &&
+         (feat_l2_cat = xzalloc(struct feat_node)) == NULL )
+    {
+        xfree(feat_l3_cat);
+        feat_l3_cat = NULL;
+
+        xfree(feat_l3_cdp);
+        feat_l3_cdp = NULL;
         return -ENOMEM;
     }
 

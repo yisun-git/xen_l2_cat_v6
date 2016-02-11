@@ -23,6 +23,7 @@
 
 /* Resource Type Enumeration */
 #define PSR_RESOURCE_TYPE_L3       0x2
+#define PSR_RESOURCE_TYPE_L2       0x4
 
 /* L3 Monitoring Features */
 #define PSR_CMT_L3_OCCUPANCY       0x1
