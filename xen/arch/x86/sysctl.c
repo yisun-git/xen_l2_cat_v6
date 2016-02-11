@@ -207,6 +207,21 @@ long arch_do_sysctl(
                 ret = -EFAULT;
             break;
         }
+        case XEN_SYSCTL_PSR_CAT_get_l2_info:
+        {
+            uint32_t dat[2];
+            ret = psr_get_info(sysctl->u.psr_cat_op.target,
+                               PSR_CBM_TYPE_L2, dat, 2);
+            if ( ret )
+                break;
+
+            sysctl->u.psr_cat_op.u.l2_info.cbm_len = dat[CBM_LEN];
+            sysctl->u.psr_cat_op.u.l2_info.cos_max = dat[COS_MAX];
+
+            if ( !ret && __copy_field_to_guest(u_sysctl, sysctl, u.psr_cat_op) )
+                ret = -EFAULT;
+            break;
+        }
         default:
             ret = -EOPNOTSUPP;
             break;

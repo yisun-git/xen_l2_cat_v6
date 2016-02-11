@@ -744,6 +744,7 @@ typedef struct xen_sysctl_pcitopoinfo xen_sysctl_pcitopoinfo_t;
 DEFINE_XEN_GUEST_HANDLE(xen_sysctl_pcitopoinfo_t);
 
 #define XEN_SYSCTL_PSR_CAT_get_l3_info               0
+#define XEN_SYSCTL_PSR_CAT_get_l2_info               1
 struct xen_sysctl_psr_cat_op {
     uint32_t cmd;       /* IN: XEN_SYSCTL_PSR_CAT_* */
     uint32_t target;    /* IN */
@@ -754,6 +755,11 @@ struct xen_sysctl_psr_cat_op {
 #define XEN_SYSCTL_PSR_CAT_L3_CDP       (1u << 0)
             uint32_t flags;     /* OUT: CAT flags */
         } l3_info;
+
+        struct {
+            uint32_t cbm_len;   /* OUT: CBM length */
+            uint32_t cos_max;   /* OUT: Maximum COS */
+        } l2_info;
     } u;
 };
 typedef struct xen_sysctl_psr_cat_op xen_sysctl_psr_cat_op_t;

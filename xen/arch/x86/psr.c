@@ -273,6 +273,9 @@ static enum psr_feat_type psr_cbm_type_to_feat_type(enum cbm_type type)
     case PSR_CBM_TYPE_L3_CODE:
         feat_type = PSR_SOCKET_L3_CDP;
         break;
+    case PSR_CBM_TYPE_L2:
+        feat_type = PSR_SOCKET_L2_CAT;
+        break;
     default:
         feat_type = PSR_SOCKET_UNKNOWN;
         break;
@@ -726,8 +729,21 @@ static unsigned int l2_cat_get_cos_max(const struct feat_node *feat)
     return feat->info.l2_cat_info.cos_max;
 }
 
+static bool l2_cat_get_feat_info(const struct feat_node *feat,
+                                 uint32_t data[], uint32_t array_len)
+{
+    if ( !data || 2 > array_len )
+        return false;
+
+    data[CBM_LEN] = feat->info.l2_cat_info.cbm_len;
+    data[COS_MAX] = feat->info.l2_cat_info.cos_max;
+
+    return true;
+}
+
 struct feat_ops l2_cat_ops = {
     .get_cos_max = l2_cat_get_cos_max,
+    .get_feat_info = l2_cat_get_feat_info,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
