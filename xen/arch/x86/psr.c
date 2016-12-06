@@ -17,11 +17,117 @@
 #include <xen/cpu.h>
 #include <xen/err.h>
 #include <xen/sched.h>
+#include <xen/list.h>
 #include <asm/psr.h>
+
+/*
+ * Terminology:
+ * - CAT         Cache Allocation Technology
+ * - CBM         Capacity BitMasks
+ * - CDP         Code and Data Prioritization
+ * - COS/CLOS    Class of Service. Also mean COS registers.
+ * - COS_MAX     Max number of COS for the feature (minus 1)
+ * - MSRs        Machine Specific Registers
+ * - PSR         Intel Platform Shared Resource
+ */
 
 #define PSR_CMT        (1<<0)
 #define PSR_CAT        (1<<1)
 #define PSR_CDP        (1<<2)
+
+/*
+ * Per SDM chapter 'Cache Allocation Technology: Cache Mask Configuration',
+ * the MSRs ranging from 0C90H through 0D0FH (inclusive), enables support for
+ * up to 128 L3 CAT Classes of Service. The COS_ID=[0,127].
+ *
+ * The MSRs ranging from 0D10H through 0D4FH (inclusive), enables support for
+ * up to 64 L2 CAT COS. The COS_ID=[0,63].
+ *
+ * So, the maximum COS register count of one feature is 128.
+ */
+#define MAX_COS_REG_CNT  128
+
+/*
+ * PSR features are managed per socket. Below structure defines the members
+ * used to manage these features.
+ * feat_mask - Mask used to record features enabled on socket. There may be
+ *             some features enabled at same time.
+ * nr_feat   - Record how many features enabled.
+ * feat_list - A list used to manage all features enabled.
+ * cos_ref   - A reference count array to record how many domains are using the
+ *             COS_ID.
+ *             Every entry of cos_ref corresponds to one COS ID.
+ * ref_lock  - A lock to protect cos_ref.
+ */
+struct psr_socket_info {
+    /*
+     * It maps to values defined in 'enum psr_feat_type' below. Value in 'enum
+     * psr_feat_type' means the bit position.
+     * bit 0:   L3 CAT
+     * bit 1:   L3 CDP
+     * bit 2:   L2 CAT
+     */
+    unsigned int feat_mask;
+    unsigned int nr_feat;
+    struct list_head feat_list;
+    unsigned int cos_ref[MAX_COS_REG_CNT];
+    spinlock_t ref_lock;
+};
+
+enum psr_feat_type {
+    PSR_SOCKET_L3_CAT = 0,
+    PSR_SOCKET_L3_CDP,
+    PSR_SOCKET_L2_CAT,
+};
+
+/* CAT/CDP HW info data structure. */
+struct psr_cat_hw_info {
+    unsigned int cbm_len;
+    unsigned int cos_max;
+};
+
+/* Encapsulate feature specific HW info here. */
+struct feat_hw_info {
+    union {
+        struct psr_cat_hw_info l3_cat_info;
+    };
+};
+
+struct feat_node;
+
+/*
+ * This structure defines feature operation callback functions. Every feature
+ * enabled MUST implement such callback functions and register them to ops.
+ *
+ * Feature specific behaviors will be encapsulated into these callback
+ * functions. Then, the main flows will not be changed when introducing a new
+ * feature.
+ */
+struct feat_ops {
+    /* get_cos_max is used to get feature's cos_max. */
+    unsigned int (*get_cos_max)(const struct feat_node *feat);
+};
+
+/*
+ * This structure represents one feature.
+ * feature     - Which feature it is.
+ * feat_ops    - Feature operation callback functions.
+ * info        - Feature HW info.
+ * cos_reg_val - Array to store the values of COS registers. One entry stores
+ *               the value of one COS register.
+ *               For L3 CAT and L2 CAT, one entry corresponds to one COS_ID.
+ *               For CDP, two entries correspond to one COS_ID. E.g.
+ *               COS_ID=0 corresponds to cos_reg_val[0] (Data) and
+ *               cos_reg_val[1] (Code).
+ * list        - Feature list.
+ */
+struct feat_node {
+    enum psr_feat_type feature;
+    struct feat_ops ops;
+    struct feat_hw_info info;
+    uint64_t cos_reg_val[MAX_COS_REG_CNT];
+    struct list_head list;
+};
 
 struct psr_assoc {
     uint64_t val;
