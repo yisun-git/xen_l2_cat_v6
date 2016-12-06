@@ -19,6 +19,7 @@
 #include <xen/sched.h>
 #include <xen/list.h>
 #include <asm/psr.h>
+#include <asm/x86_emulate.h>
 
 /*
  * Terminology:
@@ -34,6 +35,9 @@
 #define PSR_CMT        (1<<0)
 #define PSR_CAT        (1<<1)
 #define PSR_CDP        (1<<2)
+
+#define CAT_CBM_LEN_MASK 0x1f
+#define CAT_COS_MAX_MASK 0xffff
 
 /*
  * Per SDM chapter 'Cache Allocation Technology: Cache Mask Configuration',
@@ -136,10 +140,83 @@ struct psr_assoc {
 
 struct psr_cmt *__read_mostly psr_cmt;
 
+static struct psr_socket_info *__read_mostly socket_info;
+
 static unsigned int opt_psr;
 static unsigned int __initdata opt_rmid_max = 255;
+static unsigned int __read_mostly opt_cos_max = MAX_COS_REG_CNT;
 static uint64_t rmid_mask;
 static DEFINE_PER_CPU(struct psr_assoc, psr_assoc);
+
+/*
+ * Declare global feature list entry for every feature to facilitate the
+ * feature list creation. It will be allocated in psr_cpu_prepare() and
+ * inserted into feature list in cpu_init_work(). It is protected by
+ * cpu_add_remove_lock spinlock.
+ */
+static struct feat_node *feat_l3_cat;
+
+/* Common functions. */
+static void free_feature(struct psr_socket_info *info)
+{
+    struct feat_node *feat, *next;
+
+    if ( !info )
+        return;
+
+    /*
+     * Free resources of features. But we do not free global feature list
+     * entry, like feat_l3_cat. Although it may cause a few memory leak,
+     * it is OK simplify things.
+     */
+    list_for_each_entry_safe(feat, next, &info->feat_list, list)
+    {
+        __clear_bit(feat->feature, &info->feat_mask);
+        list_del(&feat->list);
+        xfree(feat);
+    }
+}
+
+/* L3 CAT functions implementation. */
+static void l3_cat_init_feature(struct cpuid_leaf regs,
+                                struct feat_node *feat,
+                                struct psr_socket_info *info)
+{
+    struct psr_cat_hw_info l3_cat;
+    unsigned int socket;
+
+    /* No valid value so do not enable feature. */
+    if ( !regs.a || !regs.b )
+        return;
+
+    l3_cat.cbm_len = (regs.a & CAT_CBM_LEN_MASK) + 1;
+    l3_cat.cos_max = min(opt_cos_max, regs.d & CAT_COS_MAX_MASK);
+
+    /* cos=0 is reserved as default cbm(all bits within cbm_len are 1). */
+    feat->cos_reg_val[0] = (1ull << l3_cat.cbm_len) - 1;
+
+    feat->feature = PSR_SOCKET_L3_CAT;
+    ASSERT(!test_bit(PSR_SOCKET_L3_CAT, &info->feat_mask));
+    __set_bit(PSR_SOCKET_L3_CAT, &info->feat_mask);
+
+    feat->info.l3_cat_info = l3_cat;
+
+    info->nr_feat++;
+
+    /* Add this feature into list. */
+    list_add_tail(&feat->list, &info->feat_list);
+
+    socket = cpu_to_socket(smp_processor_id());
+    if ( !opt_cpu_info )
+        return;
+
+    printk(XENLOG_INFO "L3 CAT: enabled on socket %u, cos_max:%u, cbm_len:%u\n",
+           socket, feat->info.l3_cat_info.cos_max,
+           feat->info.l3_cat_info.cbm_len);
+}
+
+static const struct feat_ops l3_cat_ops = {
+};
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
                                   unsigned int mask)
@@ -179,6 +256,9 @@ static void __init parse_psr_param(char *s)
 
         if ( val_str && !strcmp(s, "rmid_max") )
             opt_rmid_max = simple_strtoul(val_str, NULL, 0);
+
+        if ( val_str && !strcmp(s, "cos_max") )
+            opt_cos_max = simple_strtoul(val_str, NULL, 0);
 
         s = ss + 1;
     } while ( ss );
@@ -335,18 +415,107 @@ void psr_domain_free(struct domain *d)
     psr_free_rmid(d);
 }
 
+static void cpu_init_work(void)
+{
+    struct psr_socket_info *info;
+    unsigned int socket;
+    unsigned int cpu = smp_processor_id();
+    struct feat_node *feat;
+    struct cpuid_leaf regs = {.a = 0, .b = 0, .c = 0, .d = 0};
+
+    if ( !cpu_has(&current_cpu_data, X86_FEATURE_PQE) )
+        return;
+    else if ( current_cpu_data.cpuid_level < PSR_CPUID_LEVEL_CAT )
+    {
+        __clear_bit(X86_FEATURE_PQE, current_cpu_data.x86_capability);
+        return;
+    }
+
+    socket = cpu_to_socket(cpu);
+    info = socket_info + socket;
+    if ( info->feat_mask )
+        return;
+
+    INIT_LIST_HEAD(&info->feat_list);
+    spin_lock_init(&info->ref_lock);
+
+    cpuid_count_leaf(PSR_CPUID_LEVEL_CAT, 0, &regs);
+    if ( regs.b & PSR_RESOURCE_TYPE_L3 )
+    {
+        cpuid_count_leaf(PSR_CPUID_LEVEL_CAT, 1, &regs);
+
+        feat = feat_l3_cat;
+        /* psr_cpu_prepare will allocate it on subsequent CPU onlining. */
+        feat_l3_cat = NULL;
+        feat->ops = l3_cat_ops;
+
+        l3_cat_init_feature(regs, feat, info);
+    }
+}
+
+static void cpu_fini_work(unsigned int cpu)
+{
+    unsigned int socket = cpu_to_socket(cpu);
+
+    if ( !socket_cpumask[socket] || cpumask_empty(socket_cpumask[socket]) )
+    {
+        free_feature(socket_info + socket);
+    }
+}
+
+static void __init init_psr(void)
+{
+    if ( opt_cos_max < 1 )
+    {
+        printk(XENLOG_INFO "CAT: disabled, cos_max is too small\n");
+        return;
+    }
+
+    socket_info = xzalloc_array(struct psr_socket_info, nr_sockets);
+
+    if ( !socket_info )
+    {
+        printk(XENLOG_INFO "Failed to alloc socket_info!\n");
+        return;
+    }
+}
+
+static void __init psr_free(void)
+{
+    unsigned int i;
+
+    for ( i = 0; i < nr_sockets; i++ )
+        free_feature(&socket_info[i]);
+
+    xfree(socket_info);
+    socket_info = NULL;
+}
+
 static int psr_cpu_prepare(unsigned int cpu)
 {
+    if ( !socket_info )
+        return 0;
+
+    /* Malloc memory for the global feature head here. */
+    if ( feat_l3_cat == NULL &&
+         (feat_l3_cat = xzalloc(struct feat_node)) == NULL )
+        return -ENOMEM;
+
     return 0;
 }
 
 static void psr_cpu_init(void)
 {
+    if ( socket_info )
+        cpu_init_work();
+
     psr_assoc_init();
 }
 
 static void psr_cpu_fini(unsigned int cpu)
 {
+    if ( socket_info )
+        cpu_fini_work(cpu);
     return;
 }
 
@@ -388,10 +557,14 @@ static int __init psr_presmp_init(void)
     if ( (opt_psr & PSR_CMT) && opt_rmid_max )
         init_psr_cmt(opt_rmid_max);
 
-    psr_cpu_prepare(0);
+    if ( opt_psr & PSR_CAT )
+        init_psr();
+
+    if ( psr_cpu_prepare(0) )
+        psr_free();
 
     psr_cpu_init();
-    if ( psr_cmt_enabled() )
+    if ( psr_cmt_enabled() || socket_info )
         register_cpu_notifier(&cpu_nfb);
 
     return 0;
