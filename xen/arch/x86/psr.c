@@ -116,6 +116,9 @@ struct feat_ops {
     /* get_feat_info is used to get feature HW info. */
     bool (*get_feat_info)(const struct feat_node *feat,
                           uint32_t data[], unsigned int array_len);
+    /* get_val is used to get feature COS register value. */
+    bool (*get_val)(const struct feat_node *feat, unsigned int cos,
+                    enum cbm_type type, uint64_t *val);
 };
 
 /*
@@ -257,9 +260,22 @@ static bool l3_cat_get_feat_info(const struct feat_node *feat,
     return true;
 }
 
+static bool l3_cat_get_val(const struct feat_node *feat, unsigned int cos,
+                           enum cbm_type type, uint64_t *val)
+{
+    if ( cos > feat->info.l3_cat_info.cos_max )
+        /* Use default value. */
+        cos = 0;
+
+    *val = feat->cos_reg_val[cos];
+
+    return true;
+}
+
 static const struct feat_ops l3_cat_ops = {
     .get_cos_max = l3_cat_get_cos_max,
     .get_feat_info = l3_cat_get_feat_info,
+    .get_val = l3_cat_get_val,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
@@ -479,12 +495,14 @@ static struct psr_socket_info *get_socket_info(unsigned int socket)
     return socket_info + socket;
 }
 
-int psr_get_info(unsigned int socket, enum cbm_type type,
-                 uint32_t data[], unsigned int array_len)
+static int __psr_get(unsigned int socket, enum cbm_type type,
+                     uint32_t data[], unsigned int array_len,
+                     struct domain *d, uint64_t *val)
 {
     const struct psr_socket_info *info = get_socket_info(socket);
     const struct feat_node *feat;
     enum psr_feat_type feat_type;
+    unsigned int cos;
 
     if ( IS_ERR(info) )
         return PTR_ERR(info);
@@ -495,6 +513,15 @@ int psr_get_info(unsigned int socket, enum cbm_type type,
         if ( feat->feature != feat_type )
             continue;
 
+        if ( d )
+        {
+            cos = d->arch.psr_cos_ids[socket];
+            if ( feat->ops.get_val(feat, cos, type, val) )
+                return 0;
+            else
+                break;
+        }
+
         if ( feat->ops.get_feat_info(feat, data, array_len) )
             return 0;
         else
@@ -504,10 +531,16 @@ int psr_get_info(unsigned int socket, enum cbm_type type,
     return -ENOENT;
 }
 
-int psr_get_l3_cbm(struct domain *d, unsigned int socket,
-                   uint64_t *cbm, enum cbm_type type)
+int psr_get_info(unsigned int socket, enum cbm_type type,
+                 uint32_t data[], unsigned int array_len)
 {
-    return 0;
+    return __psr_get(socket, type, data, array_len, NULL, NULL);
+}
+
+int psr_get_val(struct domain *d, unsigned int socket,
+                uint64_t *val, enum cbm_type type)
+{
+    return __psr_get(socket, type, NULL, 0, d, val);
 }
 
 int psr_set_l3_cbm(struct domain *d, unsigned int socket,
