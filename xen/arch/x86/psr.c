@@ -119,6 +119,32 @@ struct feat_ops {
     /* get_val is used to get feature COS register value. */
     bool (*get_val)(const struct feat_node *feat, unsigned int cos,
                     enum cbm_type type, uint64_t *val);
+    /*
+     * get_cos_num is used to get the COS registers amount used by the
+     * feature for one setting, e.g. CDP uses 2 COSs but CAT uses 1.
+     */
+    unsigned int (*get_cos_num)(const struct feat_node *feat);
+    /*
+     * get_old_val and set_new_val are a pair of functions called in order.
+     * The caller will traverse all features in the list and call both
+     * functions for every feature to do below two things:
+     * 1. get old_cos register value of all supported features and
+     * 2. set the new value for the feature.
+     *
+     * All the values are set into value array according the traversal order,
+     * meaning the same order of feature list members.
+     *
+     * The return value meaning:
+     * 0 - success.
+     * negative - error.
+     */
+    int (*get_old_val)(uint64_t val[],
+                       const struct feat_node *feat,
+                       unsigned int old_cos);
+    int (*set_new_val)(uint64_t val[],
+                       const struct feat_node *feat,
+                       enum cbm_type type,
+                       uint64_t m);
 };
 
 /*
@@ -204,6 +230,29 @@ static enum psr_feat_type psr_cbm_type_to_feat_type(enum cbm_type type)
     return feat_type;
 }
 
+static bool psr_check_cbm(unsigned int cbm_len, uint64_t cbm)
+{
+    unsigned int first_bit, zero_bit;
+
+    /* Set bits should only in the range of [0, cbm_len). */
+    if ( cbm & (~0ull << cbm_len) )
+        return false;
+
+    /* At least one bit need to be set. */
+    if ( cbm == 0 )
+        return false;
+
+    first_bit = find_first_bit(&cbm, cbm_len);
+    zero_bit = find_next_zero_bit(&cbm, cbm_len, first_bit);
+
+    /* Set bits should be contiguous. */
+    if ( zero_bit < cbm_len &&
+         find_next_bit(&cbm, cbm_len, zero_bit) < cbm_len )
+        return false;
+
+    return true;
+}
+
 /* L3 CAT functions implementation. */
 static void l3_cat_init_feature(struct cpuid_leaf regs,
                                 struct feat_node *feat,
@@ -272,10 +321,45 @@ static bool l3_cat_get_val(const struct feat_node *feat, unsigned int cos,
     return true;
 }
 
+static unsigned int l3_cat_get_cos_num(const struct feat_node *feat)
+{
+    return 1;
+}
+
+static int l3_cat_get_old_val(uint64_t val[],
+                              const struct feat_node *feat,
+                              unsigned int old_cos)
+{
+    if ( old_cos > feat->info.l3_cat_info.cos_max )
+        /* Use default value. */
+        old_cos = 0;
+
+    /* CAT */
+    val[0] =  feat->cos_reg_val[old_cos];
+
+    return 0;
+}
+
+static int l3_cat_set_new_val(uint64_t val[],
+                              const struct feat_node *feat,
+                              enum cbm_type type,
+                              uint64_t m)
+{
+    if ( !psr_check_cbm(feat->info.l3_cat_info.cbm_len, m) )
+        return -EINVAL;
+
+    val[0] = m;
+
+    return 0;
+}
+
 static const struct feat_ops l3_cat_ops = {
     .get_cos_max = l3_cat_get_cos_max,
     .get_feat_info = l3_cat_get_feat_info,
     .get_val = l3_cat_get_val,
+    .get_cos_num = l3_cat_get_cos_num,
+    .get_old_val = l3_cat_get_old_val,
+    .set_new_val = l3_cat_set_new_val,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
@@ -546,15 +630,42 @@ int psr_get_val(struct domain *d, unsigned int socket,
 /* Set value functions */
 static unsigned int get_cos_num(const struct psr_socket_info *info)
 {
-    return 0;
+    const struct feat_node *feat_tmp;
+    unsigned int num = 0;
+
+    /* Get all features total amount. */
+    list_for_each_entry(feat_tmp, &info->feat_list, list)
+        num += feat_tmp->ops.get_cos_num(feat_tmp);
+
+    return num;
 }
 
-static int assemble_val_array(uint64_t *val,
+static int combine_val_array(uint64_t *val,
                               uint32_t array_len,
                               const struct psr_socket_info *info,
                               unsigned int old_cos)
 {
-    return -EINVAL;
+    const struct feat_node *feat;
+    int ret;
+    uint64_t *val_tmp = val;
+
+    if ( !val )
+        return -EINVAL;
+
+    /* Get all features current values according to old_cos. */
+    list_for_each_entry(feat, &info->feat_list, list)
+    {
+        /* value getting order is same as feature list */
+        ret = feat->ops.get_old_val(val_tmp, feat, old_cos);
+        if ( ret )
+            return ret;
+
+        val_tmp += feat->ops.get_cos_num(feat);
+        if ( val_tmp - val > array_len)
+            return -ENOSPC;
+    }
+
+    return 0;
 }
 
 static int set_new_val_to_array(uint64_t *val,
@@ -564,7 +675,37 @@ static int set_new_val_to_array(uint64_t *val,
                                 enum cbm_type type,
                                 uint64_t m)
 {
-    return -EINVAL;
+    const struct feat_node *feat;
+    int ret;
+    uint64_t *val_tmp = val;
+
+    /* Set new value into array according to feature's position in array. */
+    list_for_each_entry(feat, &info->feat_list, list)
+    {
+        if ( feat->feature != feat_type )
+        {
+            val_tmp += feat->ops.get_cos_num(feat);
+            if ( val_tmp - val > array_len)
+                return -ENOSPC;
+
+            continue;
+        }
+
+        /*
+         * Value setting position is same as feature list.
+         * Different features may have different setting behaviors, e.g. CDP
+         * has two values (DATA/CODE) which need us to save input value to
+         * different position in the array according to type, so we have to
+         * maintain a callback function.
+         */
+        ret = feat->ops.set_new_val(val_tmp, feat, type, m);
+        if ( ret )
+            return ret;
+        else
+            break;
+    }
+
+    return 0;
 }
 
 static int find_cos(const uint64_t *val, uint32_t array_len,
@@ -635,7 +776,7 @@ int psr_set_val(struct domain *d, unsigned int socket,
     if ( !val_array )
         return -ENOMEM;
 
-    if ( (ret = assemble_val_array(val_array, array_len, info, old_cos)) != 0 )
+    if ( (ret = combine_val_array(val_array, array_len, info, old_cos)) != 0 )
     {
         xfree(val_array);
         return ret;
