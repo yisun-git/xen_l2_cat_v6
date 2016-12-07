@@ -84,6 +84,7 @@ enum psr_feat_type {
     PSR_SOCKET_L3_CAT = 0,
     PSR_SOCKET_L3_CDP,
     PSR_SOCKET_L2_CAT,
+    PSR_SOCKET_UNKNOWN = 0xFFFF,
 };
 
 /* CAT/CDP HW info data structure. */
@@ -112,6 +113,9 @@ struct feat_node;
 struct feat_ops {
     /* get_cos_max is used to get feature's cos_max. */
     unsigned int (*get_cos_max)(const struct feat_node *feat);
+    /* get_feat_info is used to get feature HW info. */
+    bool (*get_feat_info)(const struct feat_node *feat,
+                          uint32_t data[], unsigned int array_len);
 };
 
 /*
@@ -179,6 +183,24 @@ static void free_feature(struct psr_socket_info *info)
     }
 }
 
+static enum psr_feat_type psr_cbm_type_to_feat_type(enum cbm_type type)
+{
+    enum psr_feat_type feat_type;
+
+    /* Judge if feature is enabled. */
+    switch ( type )
+    {
+    case PSR_CBM_TYPE_L3:
+        feat_type = PSR_SOCKET_L3_CAT;
+        break;
+    default:
+        feat_type = PSR_SOCKET_UNKNOWN;
+        break;
+    }
+
+    return feat_type;
+}
+
 /* L3 CAT functions implementation. */
 static void l3_cat_init_feature(struct cpuid_leaf regs,
                                 struct feat_node *feat,
@@ -222,8 +244,22 @@ static unsigned int l3_cat_get_cos_max(const struct feat_node *feat)
     return feat->info.l3_cat_info.cos_max;
 }
 
+static bool l3_cat_get_feat_info(const struct feat_node *feat,
+                                 uint32_t data[], unsigned int array_len)
+{
+    if ( !data || 3 > array_len )
+        return false;
+
+    data[CBM_LEN] = feat->info.l3_cat_info.cbm_len;
+    data[COS_MAX] = feat->info.l3_cat_info.cos_max;
+    data[PSR_FLAG] = 0;
+
+    return true;
+}
+
 static const struct feat_ops l3_cat_ops = {
     .get_cos_max = l3_cat_get_cos_max,
+    .get_feat_info = l3_cat_get_feat_info,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
@@ -429,10 +465,43 @@ void psr_ctxt_switch_to(struct domain *d)
     }
 }
 
-int psr_get_cat_l3_info(unsigned int socket, uint32_t *cbm_len,
-                        uint32_t *cos_max, uint32_t *flags)
+static struct psr_socket_info *get_socket_info(unsigned int socket)
 {
-    return 0;
+    if ( !socket_info )
+        return ERR_PTR(-ENODEV);
+
+    if ( socket >= nr_sockets )
+        return ERR_PTR(-ERANGE);
+
+    if ( !socket_info[socket].feat_mask )
+        return ERR_PTR(-ENOENT);
+
+    return socket_info + socket;
+}
+
+int psr_get_info(unsigned int socket, enum cbm_type type,
+                 uint32_t data[], unsigned int array_len)
+{
+    const struct psr_socket_info *info = get_socket_info(socket);
+    const struct feat_node *feat;
+    enum psr_feat_type feat_type;
+
+    if ( IS_ERR(info) )
+        return PTR_ERR(info);
+
+    feat_type = psr_cbm_type_to_feat_type(type);
+    list_for_each_entry(feat, &info->feat_list, list)
+    {
+        if ( feat->feature != feat_type )
+            continue;
+
+        if ( feat->ops.get_feat_info(feat, data, array_len) )
+            return 0;
+        else
+            return -EINVAL;
+    }
+
+    return -ENOENT;
 }
 
 int psr_get_l3_cbm(struct domain *d, unsigned int socket,
