@@ -97,6 +97,7 @@ struct psr_cat_hw_info {
 struct feat_hw_info {
     union {
         struct psr_cat_hw_info l3_cat_info;
+        struct psr_cat_hw_info l3_cdp_info;
     };
 };
 
@@ -195,6 +196,22 @@ struct feat_node {
     struct list_head list;
 };
 
+/*
+ * get_data - get DATA COS register value from input COS ID.
+ * @feat:        the feature list entry.
+ * @cos:         the COS ID.
+ */
+#define get_cdp_data(feat, cos)                  \
+            ( feat->cos_reg_val[cos * 2] )
+
+/*
+ * get_cdp_code - get CODE COS register value from input COS ID.
+ * @feat:        the feature list entry.
+ * @cos:         the COS ID.
+ */
+#define get_cdp_code(feat, cos)                  \
+            ( feat->cos_reg_val[cos * 2 + 1] )
+
 struct psr_assoc {
     uint64_t val;
     uint64_t cos_mask;
@@ -217,6 +234,7 @@ static DEFINE_PER_CPU(struct psr_assoc, psr_assoc);
  * cpu_add_remove_lock spinlock.
  */
 static struct feat_node *feat_l3_cat;
+static struct feat_node *feat_l3_cdp;
 
 /* Common functions. */
 static void free_feature(struct psr_socket_info *info)
@@ -452,6 +470,63 @@ static const struct feat_ops l3_cat_ops = {
     .compare_val = l3_cat_compare_val,
     .fits_cos_max = l3_cat_fits_cos_max,
     .write_msr = l3_cat_write_msr,
+};
+
+/* L3 CDP functions implementation. */
+static void l3_cdp_init_feature(struct cpuid_leaf regs,
+                                struct feat_node *feat,
+                                struct psr_socket_info *info)
+{
+    struct psr_cat_hw_info l3_cdp;
+    unsigned int socket;
+    uint64_t val;
+
+    /* No valid value so do not enable feature. */
+    if ( !regs.a || !regs.d )
+        return;
+
+    l3_cdp.cbm_len = (regs.a & CAT_CBM_LEN_MASK) + 1;
+    /* Cut half of cos_max when CDP is enabled. */
+    l3_cdp.cos_max = min(opt_cos_max, regs.d & CAT_COS_MAX_MASK) >> 1;
+
+    /* cos=0 is reserved as default cbm(all ones). */
+    get_cdp_code(feat, 0) =
+                 (1ull << l3_cdp.cbm_len) - 1;
+    get_cdp_data(feat, 0) =
+                 (1ull << l3_cdp.cbm_len) - 1;
+
+    /* We only write mask1 since mask0 is always all ones by default. */
+    wrmsrl(MSR_IA32_PSR_L3_MASK(1), (1ull << l3_cdp.cbm_len) - 1);
+    rdmsrl(MSR_IA32_PSR_L3_QOS_CFG, val);
+    wrmsrl(MSR_IA32_PSR_L3_QOS_CFG, val | (1 << PSR_L3_QOS_CDP_ENABLE_BIT));
+
+    feat->feature = PSR_SOCKET_L3_CDP;
+    ASSERT(!test_bit(PSR_SOCKET_L3_CDP, &info->feat_mask));
+    __set_bit(PSR_SOCKET_L3_CDP, &info->feat_mask);
+
+    feat->info.l3_cdp_info = l3_cdp;
+
+    info->nr_feat++;
+
+    /* Add this feature into list. */
+    list_add_tail(&feat->list, &info->feat_list);
+
+    socket = cpu_to_socket(smp_processor_id());
+    if ( !opt_cpu_info )
+        return;
+
+    printk(XENLOG_INFO "L3 CDP: enabled on socket %u, cos_max:%u, cbm_len:%u\n",
+           socket, feat->info.l3_cdp_info.cos_max,
+           feat->info.l3_cdp_info.cbm_len);
+}
+
+static unsigned int l3_cdp_get_cos_max(const struct feat_node *feat)
+{
+    return feat->info.l3_cdp_info.cos_max;
+}
+
+struct feat_ops l3_cdp_ops = {
+    .get_cos_max = l3_cdp_get_cos_max,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
@@ -1211,12 +1286,21 @@ static void cpu_init_work(void)
     {
         cpuid_count_leaf(PSR_CPUID_LEVEL_CAT, 1, &regs);
 
-        feat = feat_l3_cat;
-        /* psr_cpu_prepare will allocate it on subsequent CPU onlining. */
-        feat_l3_cat = NULL;
-        feat->ops = l3_cat_ops;
-
-        l3_cat_init_feature(regs, feat, info);
+        if ( (regs.c & PSR_CAT_CDP_CAPABILITY) && (opt_psr & PSR_CDP) &&
+             !test_bit(PSR_SOCKET_L3_CDP, &info->feat_mask) )
+        {
+            feat = feat_l3_cdp;
+            /* psr_cpu_prepare will allocate it on subsequent CPU onlining. */
+            feat_l3_cdp = NULL;
+            feat->ops = l3_cdp_ops;
+            l3_cdp_init_feature(regs, feat, info);
+        } else {
+            feat = feat_l3_cat;
+            /* psr_cpu_prepare will allocate it on subsequent CPU onlining. */
+            feat_l3_cat = NULL;
+            feat->ops = l3_cat_ops;
+            l3_cat_init_feature(regs, feat, info);
+        }
     }
 }
 
@@ -1267,6 +1351,14 @@ static int psr_cpu_prepare(unsigned int cpu)
     if ( feat_l3_cat == NULL &&
          (feat_l3_cat = xzalloc(struct feat_node)) == NULL )
         return -ENOMEM;
+
+    if ( feat_l3_cdp == NULL &&
+         (feat_l3_cdp = xzalloc(struct feat_node)) == NULL )
+    {
+        xfree(feat_l3_cat);
+        feat_l3_cat = NULL;
+        return -ENOMEM;
+    }
 
     return 0;
 }
