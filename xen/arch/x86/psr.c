@@ -542,9 +542,25 @@ static bool l3_cdp_get_feat_info(const struct feat_node *feat,
     return true;
 }
 
+static bool l3_cdp_get_val(const struct feat_node *feat, unsigned int cos,
+                           enum cbm_type type, uint64_t *val)
+{
+    if ( cos > feat->info.l3_cdp_info.cos_max )
+        /* Use default value. */
+        cos = 0;
+
+    if ( type == PSR_CBM_TYPE_L3_DATA )
+        *val = get_cdp_data(feat, cos);
+    else
+        *val = get_cdp_code(feat, cos);
+
+    return true;
+}
+
 struct feat_ops l3_cdp_ops = {
     .get_cos_max = l3_cdp_get_cos_max,
     .get_feat_info = l3_cdp_get_feat_info,
+    .get_val = l3_cdp_get_val,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
