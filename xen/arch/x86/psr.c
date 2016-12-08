@@ -145,6 +145,19 @@ struct feat_ops {
                        const struct feat_node *feat,
                        enum cbm_type type,
                        uint64_t m);
+    /*
+     * compare_val is used in set value process to compare if the
+     * input value array can match all the features' COS registers values
+     * according to input cos id.
+     *
+     * The return value is the amount of entries to skip in the value array
+     * or error.
+     * 1 - one entry in value array.
+     * 2 - two entries in value array, e.g. CDP uses two entries.
+     * negative - error.
+     */
+    int (*compare_val)(const uint64_t val[], const struct feat_node *feat,
+                        unsigned int cos, bool *found);
 };
 
 /*
@@ -353,6 +366,34 @@ static int l3_cat_set_new_val(uint64_t val[],
     return 0;
 }
 
+static int l3_cat_compare_val(const uint64_t val[],
+                              const struct feat_node *feat,
+                              unsigned int cos, bool *found)
+{
+    uint64_t l3_def_cbm;
+
+    l3_def_cbm = (1ull << feat->info.l3_cat_info.cbm_len) - 1;
+
+    /*
+     * Different features' cos_max are different. If cos id of the feature
+     * being set exceeds other feature's cos_max, the val of other feature
+     * must be default value. HW supports such case.
+     */
+    if ( cos > feat->info.l3_cat_info.cos_max )
+    {
+        if ( val[0] != l3_def_cbm )
+        {
+            *found = false;
+            return -ENOENT;
+        }
+        *found = true;
+    }
+    else
+        *found = (val[0] == feat->cos_reg_val[cos]);
+
+    return 0;
+}
+
 static const struct feat_ops l3_cat_ops = {
     .get_cos_max = l3_cat_get_cos_max,
     .get_feat_info = l3_cat_get_feat_info,
@@ -360,6 +401,7 @@ static const struct feat_ops l3_cat_ops = {
     .get_cos_num = l3_cat_get_cos_num,
     .get_old_val = l3_cat_get_old_val,
     .set_new_val = l3_cat_set_new_val,
+    .compare_val = l3_cat_compare_val,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
@@ -712,6 +754,57 @@ static int find_cos(const uint64_t *val, uint32_t array_len,
                     enum psr_feat_type feat_type,
                     const struct psr_socket_info *info)
 {
+    unsigned int cos;
+    const unsigned int *ref = info->cos_ref;
+    const struct feat_node *feat;
+    const uint64_t *val_tmp = val;
+    int ret;
+    bool found = false;
+    unsigned int cos_max = 0;
+
+    /* cos_max is the one of the feature which is being set. */
+    list_for_each_entry(feat, &info->feat_list, list)
+    {
+        if ( feat->feature != feat_type )
+            continue;
+
+        cos_max = feat->ops.get_cos_max(feat);
+        if ( cos_max > 0 )
+            break;
+    }
+
+    for ( cos = 0; cos <= cos_max; cos++ )
+    {
+        if ( cos && !ref[cos] )
+            continue;
+
+        /* Not found, need find again from beginning. */
+        val_tmp = val;
+        list_for_each_entry(feat, &info->feat_list, list)
+        {
+            /*
+             * Compare value according to feature list order.
+             * We must follow this order because value array is assembled
+             * as this order in get_old_set_new().
+             */
+            ret = feat->ops.compare_val(val_tmp, feat, cos, &found);
+            if ( ret < 0 )
+                return ret;
+
+            /* If fail to match, go to next cos to compare. */
+            if ( !found )
+                break;
+
+            val_tmp += feat->ops.get_cos_num(feat);
+            if ( val_tmp - val > array_len )
+                return -EINVAL;
+        }
+
+        /* For this COS ID all entries in the values array did match. Use it. */
+        if ( found )
+            return cos;
+    }
+
     return -ENOENT;
 }
 
