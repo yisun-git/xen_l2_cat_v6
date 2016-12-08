@@ -158,6 +158,17 @@ struct feat_ops {
      */
     int (*compare_val)(const uint64_t val[], const struct feat_node *feat,
                         unsigned int cos, bool *found);
+    /*
+     * fits_cos_max is used to check if the input cos id exceeds the
+     * feature's cos_max and if the input value is not the default one.
+     * Even if the associated cos exceeds the cos_max, HW can work with default
+     * value. That is the reason we need check if input value is default one.
+     * If both criteria are fulfilled, that means the input exceeds the range.
+     * If not, that means the input fits the requirements.
+     */
+    bool (*fits_cos_max)(const uint64_t val[],
+                         const struct feat_node *feat,
+                         unsigned int cos);
 };
 
 /*
@@ -394,6 +405,25 @@ static int l3_cat_compare_val(const uint64_t val[],
     return 0;
 }
 
+static bool l3_cat_fits_cos_max(const uint64_t val[],
+                                const struct feat_node *feat,
+                                unsigned int cos)
+{
+    uint64_t l3_def_cbm;
+
+    l3_def_cbm = (1ull << feat->info.l3_cat_info.cbm_len) - 1;
+
+    if ( cos > feat->info.l3_cat_info.cos_max &&
+         val[0] != l3_def_cbm )
+            /*
+             * Exceed cos_max and value to set is not default,
+             * return error.
+             */
+            return false;
+
+    return true;
+}
+
 static const struct feat_ops l3_cat_ops = {
     .get_cos_max = l3_cat_get_cos_max,
     .get_feat_info = l3_cat_get_feat_info,
@@ -402,6 +432,7 @@ static const struct feat_ops l3_cat_ops = {
     .get_old_val = l3_cat_get_old_val,
     .set_new_val = l3_cat_set_new_val,
     .compare_val = l3_cat_compare_val,
+    .fits_cos_max = l3_cat_fits_cos_max,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
@@ -808,11 +839,79 @@ static int find_cos(const uint64_t *val, uint32_t array_len,
     return -ENOENT;
 }
 
+static bool fits_cos_max(const uint64_t *val,
+                         uint32_t array_len,
+                         const struct psr_socket_info *info,
+                         unsigned int cos)
+{
+    unsigned int ret;
+    const uint64_t *val_tmp = val;
+    const struct feat_node *feat;
+
+    list_for_each_entry(feat, &info->feat_list, list)
+    {
+        ret = feat->ops.fits_cos_max(val_tmp, feat, cos);
+        if ( !ret )
+            return false;
+
+        val_tmp += feat->ops.get_cos_num(feat);
+        if ( val_tmp - val > array_len )
+            return false;
+    }
+
+    return true;
+}
+
 static int pick_avail_cos(const struct psr_socket_info *info,
                           const uint64_t *val, uint32_t array_len,
                           unsigned int old_cos,
                           enum psr_feat_type feat_type)
 {
+    unsigned int cos;
+    unsigned int cos_max = 0;
+    const struct feat_node *feat;
+    const unsigned int *ref = info->cos_ref;
+
+    /*
+     * cos_max is the one of the feature which is being set.
+     */
+    list_for_each_entry(feat, &info->feat_list, list)
+    {
+        if ( feat->feature != feat_type )
+            continue;
+
+        cos_max = feat->ops.get_cos_max(feat);
+        if ( cos_max > 0 )
+            break;
+    }
+
+    if ( !cos_max )
+        return -ENOENT;
+
+    /*
+     * If old cos is referred only by the domain, then use it. And, we cannot
+     * use id 0 because it stores the default values.
+     */
+    if ( old_cos && ref[old_cos] == 1 &&
+         fits_cos_max(val, array_len, info, old_cos) )
+            return old_cos;
+
+    /* Find an unused one other than cos0. */
+    for ( cos = 1; cos <= cos_max; cos++ )
+    {
+        /*
+         * ref is 0 means this COS is not used by other domain and
+         * can be used for current setting.
+         */
+        if ( !ref[cos] )
+        {
+            if ( !fits_cos_max(val, array_len, info, cos) )
+                return -ENOENT;
+
+            return cos;
+        }
+    }
+
     return -ENOENT;
 }
 
