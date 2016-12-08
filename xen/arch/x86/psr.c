@@ -557,10 +557,128 @@ static bool l3_cdp_get_val(const struct feat_node *feat, unsigned int cos,
     return true;
 }
 
+static unsigned int l3_cdp_get_cos_num(const struct feat_node *feat)
+{
+    return 2;
+}
+
+static int l3_cdp_get_old_val(uint64_t val[],
+                              const struct feat_node *feat,
+                              unsigned int old_cos)
+{
+    if ( old_cos > feat->info.l3_cdp_info.cos_max )
+        /* Use default value. */
+        old_cos = 0;
+
+    /* Data */
+    val[0] = get_cdp_data(feat, old_cos);
+    /* Code */
+    val[1] = get_cdp_code(feat, old_cos);
+
+    return 0;
+}
+
+static int l3_cdp_set_new_val(uint64_t val[],
+                              const struct feat_node *feat,
+                              enum cbm_type type,
+                              uint64_t m)
+{
+    if ( !psr_check_cbm(feat->info.l3_cdp_info.cbm_len, m) )
+        return -EINVAL;
+
+    if ( type == PSR_CBM_TYPE_L3_DATA )
+        val[0] = m;
+    else
+        val[1] = m;
+
+    return 0;
+}
+
+static int l3_cdp_compare_val(const uint64_t val[],
+                              const struct feat_node *feat,
+                              unsigned int cos, bool *found)
+{
+    uint64_t l3_def_cbm;
+
+    l3_def_cbm = (1ull << feat->info.l3_cdp_info.cbm_len) - 1;
+
+    /*
+     * Different features' cos_max are different. If cos id of the feature
+     * being set exceeds other feature's cos_max, the val of other feature
+     * must be default value. HW supports such case.
+     */
+    if ( cos > feat->info.l3_cdp_info.cos_max )
+    {
+        if ( val[0] != l3_def_cbm ||
+             val[1] != l3_def_cbm )
+        {
+            *found = false;
+            return -ENOENT;
+        }
+        *found = true;
+    }
+    else
+        *found = (val[0] == get_cdp_data(feat, cos) &&
+                  val[1] == get_cdp_code(feat, cos));
+
+    return 0;
+}
+
+static bool l3_cdp_fits_cos_max(const uint64_t val[],
+                                const struct feat_node *feat,
+                                unsigned int cos)
+{
+    uint64_t l3_def_cbm;
+
+    l3_def_cbm = (1ull << feat->info.l3_cdp_info.cbm_len) - 1;
+
+    if ( cos > feat->info.l3_cdp_info.cos_max &&
+         (val[0] != l3_def_cbm || val[1] != l3_def_cbm) )
+            /*
+             * Exceed cos_max and value to set is not default,
+             * return error.
+             */
+            return false;
+
+    return true;
+}
+
+static int l3_cdp_write_msr(unsigned int cos, const uint64_t val[],
+                            struct feat_node *feat)
+{
+    /*
+     * If input cos is more than the cos_max of the feature, we should
+     * not set the value.
+     */
+    if ( cos > feat->info.l3_cdp_info.cos_max )
+        return -EINVAL;
+
+    /* Data */
+    if ( get_cdp_data(feat, cos) != val[0] )
+    {
+        get_cdp_data(feat, cos) = val[0];
+        wrmsrl(MSR_IA32_PSR_L3_MASK_DATA(cos), val[0]);
+    }
+    /* Code */
+    if ( get_cdp_code(feat, cos) != val[1] )
+    {
+        get_cdp_code(feat, cos) = val[1];
+        wrmsrl(MSR_IA32_PSR_L3_MASK_CODE(cos), val[1]);
+    }
+
+    return 0;
+}
+
 struct feat_ops l3_cdp_ops = {
     .get_cos_max = l3_cdp_get_cos_max,
     .get_feat_info = l3_cdp_get_feat_info,
     .get_val = l3_cdp_get_val,
+    .get_cos_num = l3_cdp_get_cos_num,
+    .get_old_val = l3_cdp_get_old_val,
+    .set_new_val = l3_cdp_set_new_val,
+    .compare_val = l3_cdp_compare_val,
+    .fits_cos_max = l3_cdp_fits_cos_max,
+    .write_msr = l3_cdp_write_msr,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
