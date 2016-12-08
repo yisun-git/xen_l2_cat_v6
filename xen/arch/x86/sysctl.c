@@ -181,9 +181,27 @@ long arch_do_sysctl(
             ret = psr_get_info(sysctl->u.psr_cat_op.target,
                                PSR_CBM_TYPE_L3, data, 3);
 
-            sysctl->u.psr_cat_op.u.l3_info.cbm_len = data[CBM_LEN];
-            sysctl->u.psr_cat_op.u.l3_info.cos_max = data[COS_MAX];
-            sysctl->u.psr_cat_op.u.l3_info.flags   = data[PSR_FLAG];
+            if ( !ret )
+            {
+                sysctl->u.psr_cat_op.u.l3_info.cbm_len = data[CBM_LEN];
+                sysctl->u.psr_cat_op.u.l3_info.cos_max = data[COS_MAX];
+                sysctl->u.psr_cat_op.u.l3_info.flags   = data[PSR_FLAG];
+            } else {
+                /*
+                 * Check if CDP is enabled.
+                 *
+                 * Per spec, L3 CAT and CDP cannot co-exist. So, we need replace
+                 * output values to CDP's if it is enabled.
+                 */
+                ret = psr_get_info(sysctl->u.psr_cat_op.target,
+                               PSR_CBM_TYPE_L3_CODE, data, 3);
+                if ( !ret )
+                {
+                    sysctl->u.psr_cat_op.u.l3_info.cbm_len = data[CBM_LEN];
+                    sysctl->u.psr_cat_op.u.l3_info.cos_max = data[COS_MAX];
+                    sysctl->u.psr_cat_op.u.l3_info.flags   = data[PSR_FLAG];
+                }
+            }
 
             if ( !ret && __copy_field_to_guest(u_sysctl, sysctl, u.psr_cat_op) )
                 ret = -EFAULT;
