@@ -169,6 +169,9 @@ struct feat_ops {
     bool (*fits_cos_max)(const uint64_t val[],
                          const struct feat_node *feat,
                          unsigned int cos);
+    /* write_msr is used to write out feature MSR register. */
+    int (*write_msr)(unsigned int cos, const uint64_t val[],
+                     struct feat_node *feat);
 };
 
 /*
@@ -424,6 +427,21 @@ static bool l3_cat_fits_cos_max(const uint64_t val[],
     return true;
 }
 
+static int l3_cat_write_msr(unsigned int cos, const uint64_t val[],
+                            struct feat_node *feat)
+{
+    if ( cos > feat->info.l3_cat_info.cos_max )
+        return -EINVAL;
+
+    if ( feat->cos_reg_val[cos] != val[0] )
+    {
+        feat->cos_reg_val[cos] = val[0];
+        wrmsrl(MSR_IA32_PSR_L3_MASK(cos), val[0]);
+    }
+
+    return 0;
+}
+
 static const struct feat_ops l3_cat_ops = {
     .get_cos_max = l3_cat_get_cos_max,
     .get_feat_info = l3_cat_get_feat_info,
@@ -433,6 +451,7 @@ static const struct feat_ops l3_cat_ops = {
     .set_new_val = l3_cat_set_new_val,
     .compare_val = l3_cat_compare_val,
     .fits_cos_max = l3_cat_fits_cos_max,
+    .write_msr = l3_cat_write_msr,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
@@ -915,10 +934,67 @@ static int pick_avail_cos(const struct psr_socket_info *info,
     return -ENOENT;
 }
 
+static unsigned int get_socket_cpu(unsigned int socket)
+{
+    if ( likely(socket < nr_sockets) )
+        return cpumask_any(socket_cpumask[socket]);
+
+    return nr_cpu_ids;
+}
+
+struct cos_write_info
+{
+    unsigned int cos;
+    struct list_head *feat_list;
+    const uint64_t *val;
+};
+
+static void do_write_psr_msr(void *data)
+{
+    struct cos_write_info *info = (struct cos_write_info *)data;
+    unsigned int cos           = info->cos;
+    struct list_head *feat_list= info->feat_list;
+    const uint64_t *val        = info->val;
+    struct feat_node *feat;
+    int ret;
+
+    if ( !feat_list )
+        return;
+
+    /* We need set all features values into MSRs. */
+    list_for_each_entry(feat, feat_list, list)
+    {
+        ret = feat->ops.write_msr(cos, val, feat);
+        if ( ret < 0 )
+            return;
+
+        val += feat->ops.get_cos_num(feat);
+    }
+}
+
 static int write_psr_msr(unsigned int socket, unsigned int cos,
                          const uint64_t *val)
 {
-    return -ENOENT;
+    struct psr_socket_info *info = get_socket_info(socket);
+    struct cos_write_info data =
+    {
+        .cos = cos,
+        .feat_list = &info->feat_list,
+        .val = val,
+    };
+
+    if ( socket == cpu_to_socket(smp_processor_id()) )
+        do_write_psr_msr(&data);
+    else
+    {
+        unsigned int cpu = get_socket_cpu(socket);
+
+        if ( cpu >= nr_cpu_ids )
+            return -ENOTSOCK;
+        on_selected_cpus(cpumask_of(cpu), do_write_psr_msr, &data, 1);
+    }
+
+    return 0;
 }
 
 int psr_set_val(struct domain *d, unsigned int socket,
