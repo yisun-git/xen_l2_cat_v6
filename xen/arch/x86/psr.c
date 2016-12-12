@@ -741,9 +741,21 @@ static bool l2_cat_get_feat_info(const struct feat_node *feat,
     return true;
 }
 
+static bool l2_cat_get_val(const struct feat_node *feat, unsigned int cos,
+                          enum cbm_type type, uint64_t *val)
+{
+    if ( cos > feat->info.l2_cat_info.cos_max )
+        cos = 0;
+
+    *val = feat->cos_reg_val[cos];
+
+    return true;
+}
+
 struct feat_ops l2_cat_ops = {
     .get_cos_max = l2_cat_get_cos_max,
     .get_feat_info = l2_cat_get_feat_info,
+    .get_val = l2_cat_get_val,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
