@@ -752,10 +752,102 @@ static bool l2_cat_get_val(const struct feat_node *feat, unsigned int cos,
     return true;
 }
 
+static unsigned int l2_cat_get_cos_num(const struct feat_node *feat)
+{
+    /* L2 CAT uses one COS. */
+    return 1;
+}
+
+static int l2_cat_get_old_val(uint64_t val[],
+                              const struct feat_node *feat,
+                              unsigned int old_cos)
+{
+    if ( old_cos > feat->info.l2_cat_info.cos_max )
+        /* Use default value. */
+        old_cos = 0;
+
+    val[0] = feat->cos_reg_val[old_cos];
+
+    return 0;
+}
+
+static int l2_cat_set_new_val(uint64_t val[],
+                              const struct feat_node *feat,
+                              enum cbm_type type,
+                              uint64_t m)
+{
+    if ( !psr_check_cbm(feat->info.l2_cat_info.cbm_len, m) )
+        return -EINVAL;
+
+    val[0] = m;
+
+    return 0;
+}
+
+static int l2_cat_compare_val(const uint64_t val[],
+                              const struct feat_node *feat,
+                              unsigned int cos, bool *found)
+{
+    uint64_t l2_def_cbm;
+
+    l2_def_cbm = (1ull << feat->info.l2_cat_info.cbm_len) - 1;
+
+    if ( cos > feat->info.l2_cat_info.cos_max )
+    {
+        if ( val[0] != l2_def_cbm )
+        {
+            *found = false;
+            return -ENOENT;
+        }
+        *found = true;
+    }
+    else
+        *found = (val[0] == feat->cos_reg_val[cos]);
+
+    return 0;
+}
+
+static bool l2_cat_fits_cos_max(const uint64_t val[],
+                                const struct feat_node *feat,
+                                unsigned int cos)
+{
+    uint64_t l2_def_cbm;
+
+    l2_def_cbm = (1ull << feat->info.l2_cat_info.cbm_len) - 1;
+
+    if ( cos > feat->info.l2_cat_info.cos_max &&
+         val[0] != l2_def_cbm )
+            /*
+             * Exceed cos_max and value to set is not default,
+             * return error.
+             */
+            return false;
+
+    return true;
+}
+
+static int l2_cat_write_msr(unsigned int cos, const uint64_t val[],
+                            struct feat_node *feat)
+{
+    if ( cos > feat->info.l2_cat_info.cos_max )
+        return -EINVAL;
+
+    feat->cos_reg_val[cos] = val[0];
+    wrmsrl(MSR_IA32_PSR_L2_MASK(cos), val[0]);
+
+    return 0;
+}
+
 struct feat_ops l2_cat_ops = {
     .get_cos_max = l2_cat_get_cos_max,
     .get_feat_info = l2_cat_get_feat_info,
     .get_val = l2_cat_get_val,
+    .get_cos_num = l2_cat_get_cos_num,
+    .get_old_val = l2_cat_get_old_val,
+    .set_new_val = l2_cat_set_new_val,
+    .compare_val = l2_cat_compare_val,
+    .fits_cos_max = l2_cat_fits_cos_max,
+    .write_msr = l2_cat_write_msr,
 };
 
 static void __init parse_psr_bool(char *s, char *value, char *feature,
