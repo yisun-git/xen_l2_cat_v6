@@ -352,8 +352,8 @@ int libxl_psr_cat_get_cbm(libxl_ctx *ctx, uint32_t domid,
     return rc;
 }
 
-int libxl_psr_cat_get_l3_info(libxl_ctx *ctx, libxl_psr_cat_info **info,
-                              int *nr)
+int libxl_psr_cat_get_info(libxl_ctx *ctx, libxl_psr_cat_info **info,
+                           int *nr, unsigned int lvl)
 {
     GC_INIT(ctx);
     int rc;
@@ -380,9 +380,8 @@ int libxl_psr_cat_get_l3_info(libxl_ctx *ctx, libxl_psr_cat_info **info,
 
     libxl_for_each_set_bit(socketid, socketmap) {
         ptr[i].id = socketid;
-        if (xc_psr_cat_get_l3_info(ctx->xch, socketid, &ptr[i].cos_max,
-                                   &ptr[i].cbm_len, &ptr[i].cdp_enabled)) {
-            libxl__psr_cat_log_err_msg(gc, errno);
+        if (xc_psr_cat_get_info(ctx->xch, socketid, lvl, &ptr[i].cos_max,
+                                &ptr[i].cbm_len, &ptr[i].cdp_enabled)) {
             rc = ERROR_FAIL;
             free(ptr);
             goto out;
@@ -395,6 +394,16 @@ int libxl_psr_cat_get_l3_info(libxl_ctx *ctx, libxl_psr_cat_info **info,
 out:
     libxl_bitmap_dispose(&socketmap);
     GC_FREE;
+    return rc;
+}
+
+int libxl_psr_cat_get_l3_info(libxl_ctx *ctx, libxl_psr_cat_info **info,
+                              int *nr)
+{
+    int rc;
+
+    rc = libxl_psr_cat_get_info(ctx, info, nr, 3);
+
     return rc;
 }
 
